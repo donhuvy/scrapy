@@ -205,6 +205,10 @@ using the shell :ref:`Scrapy shell <topics-shell>`. Run::
    command-line, otherwise urls containing arguments (ie. ``&`` character)
    will not work.
 
+   On Windows, use double quotes instead::
+
+       scrapy shell "http://quotes.toscrape.com/page/1/"
+
 You will see something like::
 
     [ ... Scrapy log here ... ]
@@ -564,7 +568,7 @@ this time for scraping author information::
 
         def parse(self, response):
             # follow links to author pages
-            for href in response.css('.author a::attr(href)').extract():
+            for href in response.css('.author+a::attr(href)').extract():
                 yield scrapy.Request(response.urljoin(href),
                                      callback=self.parse_author)
 
