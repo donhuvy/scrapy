@@ -1,6 +1,7 @@
 import os
 import six
 import contextlib
+import shutil
 try:
     from unittest import mock
 except ImportError:
@@ -11,14 +12,16 @@ from twisted.protocols.policies import WrappingFactory
 from twisted.python.filepath import FilePath
 from twisted.internet import reactor, defer, error
 from twisted.web import server, static, util, resource
+from twisted.web._newclient import ResponseFailed
+from twisted.web.http import _DataLoss
 from twisted.web.test.test_webclient import ForeverTakingResource, \
         NoLengthResource, HostHeaderResource, \
-        PayloadResource, BrokenDownloadResource
+        PayloadResource
 from twisted.cred import portal, checkers, credentials
 from w3lib.url import path_to_file_uri
 
-from scrapy import twisted_version
 from scrapy.core.downloader.handlers import DownloadHandlers
+from scrapy.core.downloader.handlers.datauri import DataURIDownloadHandler
 from scrapy.core.downloader.handlers.file import FileDownloadHandler
 from scrapy.core.downloader.handlers.http import HTTPDownloadHandler, HttpDownloadHandler
 from scrapy.core.downloader.handlers.http10 import HTTP10DownloadHandler
@@ -28,6 +31,7 @@ from scrapy.core.downloader.handlers.s3 import S3DownloadHandler
 from scrapy.spiders import Spider
 from scrapy.http import Request
 from scrapy.http.response.text import TextResponse
+from scrapy.responsetypes import responsetypes
 from scrapy.settings import Settings
 from scrapy.utils.test import get_crawler, skip_if_no_boto
 from scrapy.utils.python import to_bytes
@@ -85,10 +89,12 @@ class FileTestCase(unittest.TestCase):
 
     def setUp(self):
         self.tmpname = self.mktemp()
-        fd = open(self.tmpname + '^', 'w')
-        fd.write('0123456789')
-        fd.close()
+        with open(self.tmpname + '^', 'w') as f:
+            f.write('0123456789')
         self.download_request = FileDownloadHandler(Settings()).download_request
+
+    def tearDown(self):
+        os.unlink(self.tmpname + '^')
 
     def test_download(self):
         def _test(response):
@@ -115,6 +121,52 @@ class ContentLengthHeaderResource(resource.Resource):
         return request.requestHeaders.getRawHeaders(b"content-length")[0]
 
 
+class ChunkedResource(resource.Resource):
+
+    def render(self, request):
+        def response():
+            request.write(b"chunked ")
+            request.write(b"content\n")
+            request.finish()
+        reactor.callLater(0, response)
+        return server.NOT_DONE_YET
+
+
+class BrokenChunkedResource(resource.Resource):
+
+    def render(self, request):
+        def response():
+            request.write(b"chunked ")
+            request.write(b"content\n")
+            # Disable terminating chunk on finish.
+            request.chunked = False
+            closeConnection(request)
+        reactor.callLater(0, response)
+        return server.NOT_DONE_YET
+
+
+class BrokenDownloadResource(resource.Resource):
+
+    def render(self, request):
+        def response():
+            request.setHeader(b"Content-Length", b"20")
+            request.write(b"partial")
+            closeConnection(request)
+
+        reactor.callLater(0, response)
+        return server.NOT_DONE_YET
+
+
+def closeConnection(request):
+    # We have to force a disconnection for HTTP/1.1 clients. Otherwise
+    # client keeps the connection open waiting for more data.
+    if hasattr(request.channel, 'loseConnection'):  # twisted >=16.3.0
+        request.channel.loseConnection()
+    else:
+        request.channel.transport.loseConnection()
+    request.finish()
+
+
 class EmptyContentTypeHeaderResource(resource.Resource):
     """
     A testing resource which renders itself as the value of request body
@@ -135,10 +187,10 @@ class HttpTestCase(unittest.TestCase):
     certfile = 'keys/cert.pem'
 
     def setUp(self):
-        name = self.mktemp()
-        os.mkdir(name)
-        FilePath(name).child("file").setContent(b"0123456789")
-        r = static.File(name)
+        self.tmpname = self.mktemp()
+        os.mkdir(self.tmpname)
+        FilePath(self.tmpname).child("file").setContent(b"0123456789")
+        r = static.File(self.tmpname)
         r.putChild(b"redirect", util.Redirect(b"/file"))
         r.putChild(b"wait", ForeverTakingResource())
         r.putChild(b"hang-after-headers", ForeverTakingResource(write=True))
@@ -146,6 +198,8 @@ class HttpTestCase(unittest.TestCase):
         r.putChild(b"host", HostHeaderResource())
         r.putChild(b"payload", PayloadResource())
         r.putChild(b"broken", BrokenDownloadResource())
+        r.putChild(b"chunked", ChunkedResource())
+        r.putChild(b"broken-chunked", BrokenChunkedResource())
         r.putChild(b"contentlength", ContentLengthHeaderResource())
         r.putChild(b"nocontenttype", EmptyContentTypeHeaderResource())
         self.site = server.Site(r, timeout=None)
@@ -166,6 +220,7 @@ class HttpTestCase(unittest.TestCase):
         yield self.port.stopListening()
         if hasattr(self.download_handler, 'close'):
             yield self.download_handler.close()
+        shutil.rmtree(self.tmpname)
 
     def getURL(self, path):
         return "%s://%s:%d/%s" % (self.scheme, self.host, self.portno, path)
@@ -281,8 +336,6 @@ class Https10TestCase(Http10TestCase):
 class Http11TestCase(HttpTestCase):
     """HTTP 1.1 test case"""
     download_handler_cls = HTTP11DownloadHandler
-    if twisted_version < (11, 1, 0):
-        skip = 'HTTP1.1 not supported in twisted < 11.1.0'
 
     def test_download_without_maxsize_limit(self):
         request = Request(self.getURL('file'))
@@ -339,6 +392,53 @@ class Http11TestCase(HttpTestCase):
         d.addCallback(self.assertEquals, b"0123456789")
         return d
 
+    def test_download_chunked_content(self):
+        request = Request(self.getURL('chunked'))
+        d = self.download_request(request, Spider('foo'))
+        d.addCallback(lambda r: r.body)
+        d.addCallback(self.assertEquals, b"chunked content\n")
+        return d
+
+    def test_download_broken_content_cause_data_loss(self, url='broken'):
+        request = Request(self.getURL(url))
+        d = self.download_request(request, Spider('foo'))
+
+        def checkDataLoss(failure):
+            if failure.check(ResponseFailed):
+                if any(r.check(_DataLoss) for r in failure.value.reasons):
+                    return None
+            return failure
+
+        d.addCallback(lambda _: self.fail("No DataLoss exception"))
+        d.addErrback(checkDataLoss)
+        return d
+
+    def test_download_broken_chunked_content_cause_data_loss(self):
+        return self.test_download_broken_content_cause_data_loss('broken-chunked')
+
+    def test_download_broken_content_allow_data_loss(self, url='broken'):
+        request = Request(self.getURL(url), meta={'download_fail_on_dataloss': False})
+        d = self.download_request(request, Spider('foo'))
+        d.addCallback(lambda r: r.flags)
+        d.addCallback(self.assertEqual, ['dataloss'])
+        return d
+
+    def test_download_broken_chunked_content_allow_data_loss(self):
+        return self.test_download_broken_content_allow_data_loss('broken-chunked')
+
+    def test_download_broken_content_allow_data_loss_via_setting(self, url='broken'):
+        download_handler = self.download_handler_cls(Settings({
+            'DOWNLOAD_FAIL_ON_DATALOSS': False,
+        }))
+        request = Request(self.getURL(url))
+        d = download_handler.download_request(request, Spider('foo'))
+        d.addCallback(lambda r: r.flags)
+        d.addCallback(self.assertEqual, ['dataloss'])
+        return d
+
+    def test_download_broken_chunked_content_allow_data_loss_via_setting(self):
+        return self.test_download_broken_content_allow_data_loss_via_setting('broken-chunked')
+
 
 class Https11TestCase(Http11TestCase):
     scheme = 'https'
@@ -366,8 +466,6 @@ class Https11InvalidDNSId(Https11TestCase):
 
 class Http11MockServerTestCase(unittest.TestCase):
     """HTTP 1.1 test case with MockServer"""
-    if twisted_version < (11, 1, 0):
-        skip = 'HTTP1.1 not supported in twisted < 11.1.0'
 
     def setUp(self):
         self.mockserver = MockServer()
@@ -396,31 +494,27 @@ class Http11MockServerTestCase(unittest.TestCase):
 
     @defer.inlineCallbacks
     def test_download_gzip_response(self):
+        crawler = get_crawler(SingleRequestSpider)
+        body = b'1' * 100  # PayloadResource requires body length to be 100
+        request = Request('http://localhost:8998/payload', method='POST',
+                          body=body, meta={'download_maxsize': 50})
+        yield crawler.crawl(seed=request)
+        failure = crawler.spider.meta['failure']
+        # download_maxsize < 100, hence the CancelledError
+        self.assertIsInstance(failure.value, defer.CancelledError)
 
-        if twisted_version > (12, 3, 0):
-
-            crawler = get_crawler(SingleRequestSpider)
-            body = b'1'*100 # PayloadResource requires body length to be 100
-            request = Request('http://localhost:8998/payload', method='POST', body=body, meta={'download_maxsize': 50})
+        if six.PY2:
+            request.headers.setdefault(b'Accept-Encoding', b'gzip,deflate')
+            request = request.replace(url='http://localhost:8998/xpayload')
             yield crawler.crawl(seed=request)
-            failure = crawler.spider.meta['failure']
-            # download_maxsize < 100, hence the CancelledError
-            self.assertIsInstance(failure.value, defer.CancelledError)
-
-            if six.PY2:
-                request.headers.setdefault(b'Accept-Encoding', b'gzip,deflate')
-                request = request.replace(url='http://localhost:8998/xpayload')
-                yield crawler.crawl(seed=request)
-                # download_maxsize = 50 is enough for the gzipped response
-                failure = crawler.spider.meta.get('failure')
-                self.assertTrue(failure == None)
-                reason = crawler.spider.meta['close_reason']
-                self.assertTrue(reason, 'finished')
-            else:
-                # See issue https://twistedmatrix.com/trac/ticket/8175
-                raise unittest.SkipTest("xpayload only enabled for PY2")
+            # download_maxsize = 50 is enough for the gzipped response
+            failure = crawler.spider.meta.get('failure')
+            self.assertTrue(failure == None)
+            reason = crawler.spider.meta['close_reason']
+            self.assertTrue(reason, 'finished')
         else:
-            raise unittest.SkipTest("xpayload and payload endpoint only enabled for twisted > 12.3.0")
+            # See issue https://twistedmatrix.com/trac/ticket/8175
+            raise unittest.SkipTest("xpayload only enabled for PY2")
 
 
 class UriResource(resource.Resource):
@@ -500,8 +594,6 @@ class Http10ProxyTestCase(HttpProxyTestCase):
 
 class Http11ProxyTestCase(HttpProxyTestCase):
     download_handler_cls = HTTP11DownloadHandler
-    if twisted_version < (11, 1, 0):
-        skip = 'HTTP1.1 not supported in twisted < 11.1.0'
 
     @defer.inlineCallbacks
     def test_download_with_proxy_https_timeout(self):
@@ -687,15 +779,11 @@ class S3TestCase(unittest.TestCase):
             b'AWS 0PN5J17HBGZHT7JJ3X82:+CfvG8EZ3YccOrRVMXNaK2eKZmM=')
 
 
-class FTPTestCase(unittest.TestCase):
+class BaseFTPTestCase(unittest.TestCase):
 
     username = "scrapy"
     password = "passwd"
-
-    if twisted_version < (10, 2, 0):
-        skip = "Twisted pre 10.2.0 doesn't allow to set home path other than /home"
-    if six.PY3:
-        skip = "Twisted missing ftp support for PY3"
+    req_meta = {"ftp_user": username, "ftp_password": password}
 
     def setUp(self):
         from twisted.protocols.ftp import FTPRealm, FTPFactory
@@ -707,8 +795,8 @@ class FTPTestCase(unittest.TestCase):
         userdir = os.path.join(self.directory, self.username)
         os.mkdir(userdir)
         fp = FilePath(userdir)
-        fp.child('file.txt').setContent("I have the power!")
-        fp.child('file with spaces.txt').setContent("Moooooooooo power!")
+        fp.child('file.txt').setContent(b"I have the power!")
+        fp.child('file with spaces.txt').setContent(b"Moooooooooo power!")
 
         # setup server
         realm = FTPRealm(anonymousRoot=self.directory, userHome=self.directory)
@@ -721,6 +809,9 @@ class FTPTestCase(unittest.TestCase):
         self.portNum = self.port.getHost().port
         self.download_handler = FTPDownloadHandler(Settings())
         self.addCleanup(self.port.stopListening)
+
+    def tearDown(self):
+        shutil.rmtree(self.directory)
 
     def _add_test_callbacks(self, deferred, callback=None, errback=None):
         def _clean(data):
@@ -735,31 +826,31 @@ class FTPTestCase(unittest.TestCase):
 
     def test_ftp_download_success(self):
         request = Request(url="ftp://127.0.0.1:%s/file.txt" % self.portNum,
-                meta={"ftp_user": self.username, "ftp_password": self.password})
+                          meta=self.req_meta)
         d = self.download_handler.download_request(request, None)
 
         def _test(r):
             self.assertEqual(r.status, 200)
-            self.assertEqual(r.body, 'I have the power!')
-            self.assertEqual(r.headers, {'Local Filename': [''], 'Size': ['17']})
+            self.assertEqual(r.body, b'I have the power!')
+            self.assertEqual(r.headers, {b'Local Filename': [b''], b'Size': [b'17']})
         return self._add_test_callbacks(d, _test)
 
     def test_ftp_download_path_with_spaces(self):
         request = Request(
             url="ftp://127.0.0.1:%s/file with spaces.txt" % self.portNum,
-            meta={"ftp_user": self.username, "ftp_password": self.password}
+            meta=self.req_meta
         )
         d = self.download_handler.download_request(request, None)
 
         def _test(r):
             self.assertEqual(r.status, 200)
-            self.assertEqual(r.body, 'Moooooooooo power!')
-            self.assertEqual(r.headers, {'Local Filename': [''], 'Size': ['18']})
+            self.assertEqual(r.body, b'Moooooooooo power!')
+            self.assertEqual(r.headers, {b'Local Filename': [b''], b'Size': [b'18']})
         return self._add_test_callbacks(d, _test)
 
     def test_ftp_download_notexist(self):
         request = Request(url="ftp://127.0.0.1:%s/notexist.txt" % self.portNum,
-                meta={"ftp_user": self.username, "ftp_password": self.password})
+                          meta=self.req_meta)
         d = self.download_handler.download_request(request, None)
 
         def _test(r):
@@ -767,27 +858,134 @@ class FTPTestCase(unittest.TestCase):
         return self._add_test_callbacks(d, _test)
 
     def test_ftp_local_filename(self):
-        local_fname = "/tmp/file.txt"
+        local_fname = b"/tmp/file.txt"
+        meta = {"ftp_local_filename": local_fname}
+        meta.update(self.req_meta)
         request = Request(url="ftp://127.0.0.1:%s/file.txt" % self.portNum,
-                meta={"ftp_user": self.username, "ftp_password": self.password, "ftp_local_filename": local_fname})
+                          meta=meta)
         d = self.download_handler.download_request(request, None)
 
         def _test(r):
             self.assertEqual(r.body, local_fname)
-            self.assertEqual(r.headers, {'Local Filename': ['/tmp/file.txt'], 'Size': ['17']})
+            self.assertEqual(r.headers, {b'Local Filename': [b'/tmp/file.txt'], b'Size': [b'17']})
             self.assertTrue(os.path.exists(local_fname))
-            with open(local_fname) as f:
-                self.assertEqual(f.read(), "I have the power!")
+            with open(local_fname, "rb") as f:
+                self.assertEqual(f.read(), b"I have the power!")
             os.remove(local_fname)
         return self._add_test_callbacks(d, _test)
+
+
+class FTPTestCase(BaseFTPTestCase):
 
     def test_invalid_credentials(self):
         from twisted.protocols.ftp import ConnectionLost
 
+        meta = dict(self.req_meta)
+        meta.update({"ftp_password": 'invalid'})
         request = Request(url="ftp://127.0.0.1:%s/file.txt" % self.portNum,
-                meta={"ftp_user": self.username, "ftp_password": 'invalid'})
+                          meta=meta)
         d = self.download_handler.download_request(request, None)
 
         def _test(r):
             self.assertEqual(r.type, ConnectionLost)
         return self._add_test_callbacks(d, errback=_test)
+
+
+class AnonymousFTPTestCase(BaseFTPTestCase):
+
+    username = "anonymous"
+    req_meta = {}
+
+    def setUp(self):
+        from twisted.protocols.ftp import FTPRealm, FTPFactory
+        from scrapy.core.downloader.handlers.ftp import FTPDownloadHandler
+
+        # setup dir and test file
+        self.directory = self.mktemp()
+        os.mkdir(self.directory)
+
+        fp = FilePath(self.directory)
+        fp.child('file.txt').setContent(b"I have the power!")
+        fp.child('file with spaces.txt').setContent(b"Moooooooooo power!")
+
+        # setup server for anonymous access
+        realm = FTPRealm(anonymousRoot=self.directory)
+        p = portal.Portal(realm)
+        p.registerChecker(checkers.AllowAnonymousAccess(),
+                          credentials.IAnonymous)
+
+        self.factory = FTPFactory(portal=p,
+                                  userAnonymous=self.username)
+        self.port = reactor.listenTCP(0, self.factory, interface="127.0.0.1")
+        self.portNum = self.port.getHost().port
+        self.download_handler = FTPDownloadHandler(Settings())
+        self.addCleanup(self.port.stopListening)
+
+    def tearDown(self):
+        shutil.rmtree(self.directory)
+
+
+class DataURITestCase(unittest.TestCase):
+
+    def setUp(self):
+        self.download_handler = DataURIDownloadHandler(Settings())
+        self.download_request = self.download_handler.download_request
+        self.spider = Spider('foo')
+
+    def test_response_attrs(self):
+        uri = "data:,A%20brief%20note"
+
+        def _test(response):
+            self.assertEquals(response.url, uri)
+            self.assertFalse(response.headers)
+
+        request = Request(uri)
+        return self.download_request(request, self.spider).addCallback(_test)
+
+    def test_default_mediatype_encoding(self):
+        def _test(response):
+            self.assertEquals(response.text, 'A brief note')
+            self.assertEquals(type(response),
+                              responsetypes.from_mimetype("text/plain"))
+            self.assertEquals(response.encoding, "US-ASCII")
+
+        request = Request("data:,A%20brief%20note")
+        return self.download_request(request, self.spider).addCallback(_test)
+
+    def test_default_mediatype(self):
+        def _test(response):
+            self.assertEquals(response.text, u'\u038e\u03a3\u038e')
+            self.assertEquals(type(response),
+                              responsetypes.from_mimetype("text/plain"))
+            self.assertEquals(response.encoding, "iso-8859-7")
+
+        request = Request("data:;charset=iso-8859-7,%be%d3%be")
+        return self.download_request(request, self.spider).addCallback(_test)
+
+    def test_text_charset(self):
+        def _test(response):
+            self.assertEquals(response.text, u'\u038e\u03a3\u038e')
+            self.assertEquals(response.body, b'\xbe\xd3\xbe')
+            self.assertEquals(response.encoding, "iso-8859-7")
+
+        request = Request("data:text/plain;charset=iso-8859-7,%be%d3%be")
+        return self.download_request(request, self.spider).addCallback(_test)
+
+    def test_mediatype_parameters(self):
+        def _test(response):
+            self.assertEquals(response.text, u'\u038e\u03a3\u038e')
+            self.assertEquals(type(response),
+                              responsetypes.from_mimetype("text/plain"))
+            self.assertEquals(response.encoding, "utf-8")
+
+        request = Request('data:text/plain;foo=%22foo;bar%5C%22%22;'
+                          'charset=utf-8;bar=%22foo;%5C%22 foo ;/,%22'
+                          ',%CE%8E%CE%A3%CE%8E')
+        return self.download_request(request, self.spider).addCallback(_test)
+
+    def test_base64(self):
+        def _test(response):
+            self.assertEquals(response.text, 'Hello, world.')
+
+        request = Request('data:text/plain;base64,SGVsbG8sIHdvcmxkLg%3D%3D')
+        return self.download_request(request, self.spider).addCallback(_test)

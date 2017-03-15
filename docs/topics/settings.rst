@@ -604,6 +604,32 @@ If you want to disable it set to 0.
 
     This feature needs Twisted >= 11.1.
 
+.. setting:: DOWNLOAD_FAIL_ON_DATALOSS
+
+DOWNLOAD_FAIL_ON_DATALOSS
+-------------------------
+
+Default: ``True``
+
+Whether or not to fail on broken responses, that is, declared
+``Content-Length`` does not match content sent by the server or chunked
+response was not properly finish. If ``True``, these responses raise a
+``ResponseFailed([_DataLoss])`` error. If ``False``, these responses
+are passed through and the flag ``dataloss`` is added to the response, i.e.:
+``'dataloss' in response.flags`` is ``True``.
+
+Optionally, this can be set per-request basis by using the
+:reqmeta:`download_fail_on_dataloss` Request.meta key to ``False``.
+
+.. note::
+
+  A broken response, or data loss error, may happen under several
+  circumstances, from server misconfiguration to network errors to data
+  corruption. It is up to the user to decide if it makes sense to process
+  broken responses considering they may contain partial or incomplete content.
+  If setting:`RETRY_ENABLED` is ``True`` and this setting is set to ``True``,
+  the ``ResponseFailed([_DataLoss])`` failure will be retried as usual.
+
 .. setting:: DUPEFILTER_CLASS
 
 DUPEFILTER_CLASS
@@ -686,6 +712,42 @@ The Feed Temp dir allows you to set a custom folder to save crawler
 temporary files before uploading with :ref:`FTP feed storage <topics-feed-storage-ftp>` and
 :ref:`Amazon S3 <topics-feed-storage-s3>`.
 
+.. setting:: FTP_PASSIVE_MODE
+
+FTP_PASSIVE_MODE
+----------------
+
+Default: ``True``
+
+Whether or not to use passive mode when initiating FTP transfers.
+
+.. setting:: FTP_PASSWORD
+
+FTP_PASSWORD
+------------
+
+Default: ``"guest"``
+
+The password to use for FTP connections when there is no ``"ftp_password"``
+in ``Request`` meta.
+
+.. note::
+    Paraphrasing `RFC 1635`_, although it is common to use either the password
+    "guest" or one's e-mail address for anonymous FTP,
+    some FTP servers explicitly ask for the user's e-mail address
+    and will not allow login with the "guest" password.
+
+.. _RFC 1635: https://tools.ietf.org/html/rfc1635
+
+.. setting:: FTP_USER
+
+FTP_USER
+--------
+
+Default: ``"anonymous"``
+
+The username to use for FTP connections when there is no ``"ftp_user"``
+in ``Request`` meta.
 
 .. setting:: ITEM_PIPELINES
 
@@ -827,13 +889,15 @@ Example::
 MEMUSAGE_ENABLED
 ----------------
 
-Default: ``False``
+Default: ``True``
 
 Scope: ``scrapy.extensions.memusage``
 
-Whether to enable the memory usage extension that will shutdown the Scrapy
-process when it exceeds a memory limit, and also notify by email when that
-happened.
+Whether to enable the memory usage extension. This extension keeps track of
+a peak memory used by the process (it writes it to stats). It can also
+optionally shutdown the Scrapy process when it exceeds a memory limit
+(see :setting:`MEMUSAGE_LIMIT_MB`), and notify by email when that happened
+(see :setting:`MEMUSAGE_NOTIFY_MAIL`).
 
 See :ref:`topics-extensions-ref-memusage`.
 
@@ -1115,6 +1179,29 @@ Default: ``'scrapy.spiderloader.SpiderLoader'``
 
 The class that will be used for loading spiders, which must implement the
 :ref:`topics-api-spiderloader`.
+
+.. setting:: SPIDER_LOADER_WARN_ONLY
+
+SPIDER_LOADER_WARN_ONLY
+-----------------------
+
+.. versionadded:: 1.3.3
+
+Default: ``False``
+
+By default, when scrapy tries to import spider classes from :setting:`SPIDER_MODULES`,
+it will fail loudly if there is any ``ImportError`` exception.
+But you can choose to silence this exception and turn it into a simple
+warning by setting ``SPIDER_LOADER_WARN_ONLY = True``.
+
+.. note::
+    Some :ref:`scrapy commands <topics-commands>` run with this setting to ``True``
+    already (i.e. they will only issue a warning and will not fail)
+    since they do not actually need to load spider classes to work:
+    :command:`scrapy runspider <runspider>`,
+    :command:`scrapy settings <settings>`,
+    :command:`scrapy startproject <startproject>`,
+    :command:`scrapy version <version>`.
 
 .. setting:: SPIDER_MIDDLEWARES
 

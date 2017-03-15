@@ -121,6 +121,9 @@ Request objects
        see :ref:`topics-request-response-ref-errbacks` below.
     :type errback: callable
 
+    :param flags:  Flags sent to the request, can be used for logging or similar purposes.
+    :type flags: list
+
     .. attribute:: Request.url
 
         A string containing the URL of this request. Keep in mind that this
@@ -207,12 +210,12 @@ different fields from different pages::
         request = scrapy.Request("http://www.example.com/some_page.html",
                                  callback=self.parse_page2)
         request.meta['item'] = item
-        return request
+        yield request
 
     def parse_page2(self, response):
         item = response.meta['item']
         item['other_url'] = response.url
-        return item
+        yield item
 
 
 .. _topics-request-response-ref-errbacks:
@@ -300,7 +303,11 @@ Those are:
 * :reqmeta:`download_timeout`
 * :reqmeta:`download_maxsize`
 * :reqmeta:`download_latency`
+* :reqmeta:`download_fail_on_dataloss`
 * :reqmeta:`proxy`
+* ``ftp_user`` (See :setting:`FTP_USER` for more info)
+* ``ftp_password`` (See :setting:`FTP_PASSWORD` for more info)
+* :reqmeta:`referrer_policy`
 
 .. reqmeta:: bindaddress
 
@@ -326,6 +333,14 @@ The amount of time spent to fetch the response, since the request has been
 started, i.e. HTTP message sent over the network. This meta key only becomes
 available when the response has been downloaded. While most other meta keys are
 used to control Scrapy behavior, this one is supposed to be read-only.
+
+.. reqmeta:: download_fail_on_dataloss
+
+download_fail_on_dataloss
+-------------------------
+
+Whether or not to fail on broken responses. See:
+:setting:`DOWNLOAD_FAIL_ON_DATALOSS`.
 
 .. _topics-request-response-ref-request-subclasses:
 
@@ -375,6 +390,10 @@ fields with form data from :class:`Response` objects.
        ``dont_click`` argument to ``True``. Also, if you want to change the
        control clicked (instead of disabling it) you can also use the
        ``clickdata`` argument.
+
+       .. caution:: Using this method with select elements which have leading
+          or trailing whitespace in the option values will not work due to a
+          `bug in lxml`_, which should be fixed in lxml 3.8 and above.
 
        :param response: the response containing a HTML form which will be used
           to pre-populate the form fields
@@ -597,6 +616,9 @@ Response objects
 
             urlparse.urljoin(response.url, url)
 
+    .. automethod:: Response.follow
+
+
 .. _urlparse.urljoin: https://docs.python.org/2/library/urlparse.html#urlparse.urljoin
 
 .. _topics-request-response-ref-response-subclasses:
@@ -683,6 +705,8 @@ TextResponse objects
 
             response.css('p')
 
+    .. automethod:: TextResponse.follow
+
     .. method:: TextResponse.body_as_unicode()
 
         The same as :attr:`text`, but available as a method. This method is
@@ -710,3 +734,4 @@ XmlResponse objects
     line.  See :attr:`TextResponse.encoding`.
 
 .. _Twisted Failure: https://twistedmatrix.com/documents/current/api/twisted.python.failure.Failure.html
+.. _bug in lxml: https://bugs.launchpad.net/lxml/+bug/1665241

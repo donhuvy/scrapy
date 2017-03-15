@@ -328,6 +328,10 @@ class SitemapSpiderTest(SpiderTest):
         r = Response(url="http://www.example.com/sitemap.xml.gz", body=self.GZBODY)
         self.assertSitemapBody(r, self.BODY)
 
+        # .xml.gz but body decoded by HttpCompression middleware already
+        r = Response(url="http://www.example.com/sitemap.xml.gz", body=self.BODY)
+        self.assertSitemapBody(r, self.BODY)
+
     def test_get_sitemap_urls_from_robotstxt(self):
         robots = b"""# Sitemap files
 Sitemap: http://example.com/sitemap.xml
@@ -345,7 +349,7 @@ Sitemap: /sitemap-relative-url.xml
                           'http://www.example.com/sitemap-relative-url.xml'])
 
 
-class BaseSpiderDeprecationTest(unittest.TestCase):
+class DeprecationTest(unittest.TestCase):
 
     def test_basespider_is_deprecated(self):
         with warnings.catch_warnings(record=True) as w:
@@ -399,6 +403,29 @@ class BaseSpiderDeprecationTest(unittest.TestCase):
         assert isinstance(CrawlSpider(name='foo'), Spider)
         assert isinstance(CrawlSpider(name='foo'), BaseSpider)
 
+    def test_make_requests_from_url_deprecated(self):
+        class MySpider4(Spider):
+            name = 'spider1'
+            start_urls = ['http://example.com']
 
-if __name__ == '__main__':
-    unittest.main()
+        class MySpider5(Spider):
+            name = 'spider2'
+            start_urls = ['http://example.com']
+
+            def make_requests_from_url(self, url):
+                return Request(url + "/foo", dont_filter=True)
+
+        with warnings.catch_warnings(record=True) as w:
+            # spider without overridden make_requests_from_url method
+            # doesn't issue a warning
+            spider1 = MySpider4()
+            self.assertEqual(len(list(spider1.start_requests())), 1)
+            self.assertEqual(len(w), 0)
+
+            # spider with overridden make_requests_from_url issues a warning,
+            # but the method still works
+            spider2 = MySpider5()
+            requests = list(spider2.start_requests())
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0].url, 'http://example.com/foo')
+            self.assertEqual(len(w), 1)

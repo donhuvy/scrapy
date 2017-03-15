@@ -645,6 +645,12 @@ HttpCompressionMiddleware
    This middleware allows compressed (gzip, deflate) traffic to be
    sent/received from web sites.
 
+   This middleware also supports decoding `brotli-compressed`_ responses,
+   provided `brotlipy`_ is installed.
+
+.. _brotli-compressed: https://www.ietf.org/rfc/rfc7932.txt
+.. _brotlipy: https://pypi.python.org/pypi/brotlipy
+
 HttpCompressionMiddleware Settings
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -681,7 +687,9 @@ HttpProxyMiddleware
    * ``no_proxy``
 
    You can also set the meta key ``proxy`` per-request, to a value like
-   ``http://some_proxy_server:port``.
+   ``http://some_proxy_server:port`` or ``http://username:password@some_proxy_server:port``.
+   Keep in mind this value will take precedence over ``http_proxy``/``https_proxy``
+   environment variables, and it will also ignore ``no_proxy`` environment variable.
 
 .. _urllib: https://docs.python.org/2/library/urllib.html
 .. _urllib2: https://docs.python.org/2/library/urllib2.html
@@ -749,7 +757,7 @@ REDIRECT_MAX_TIMES
 
 Default: ``20``
 
-The maximum number of redirections that will be follow for a single request.
+The maximum number of redirections that will be followed for a single request.
 
 MetaRefreshMiddleware
 ---------------------
@@ -949,7 +957,15 @@ enable it for :ref:`broad crawls <topics-broad-crawls>`.
 HttpProxyMiddleware settings
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+.. setting:: HTTPPROXY_ENABLED
 .. setting:: HTTPPROXY_AUTH_ENCODING
+
+HTTPPROXY_ENABLED
+^^^^^^^^^^^^^^^^^
+
+Default: ``True``
+
+Whether or not to enable the :class:`HttpProxyMiddleware`.
 
 HTTPPROXY_AUTH_ENCODING
 ^^^^^^^^^^^^^^^^^^^^^^^
